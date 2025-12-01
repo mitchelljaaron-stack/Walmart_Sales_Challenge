@@ -13,6 +13,7 @@ library(recipes)
 library(embed) 
 library(dials)
 library(tune)
+library(prophet)
 
 ## Read in the Data
 train_data <- vroom("./train.csv")
@@ -50,7 +51,7 @@ train_joined <- train_data %>%
 test_joined <- test_data %>%
   left_join(imputed_features, by = c("Store", "Date"))
 
-#beat 0.4322
+#beat 4322
 
 # Recipe
 my_recipe <- recipe(Weekly_Sales ~ ., data = train_joined) %>%
@@ -61,60 +62,87 @@ my_recipe <- recipe(Weekly_Sales ~ ., data = train_joined) %>%
   step_lencode_glm(all_nominal_predictors(), outcome = vars(Weekly_Sales)) %>%
   step_normalize(all_predictors())
 
+## Need to have the column names right for prophet
+prophet_df <- train_joined %>%
+  rename(y=Weekly_Sales, ds=Date)
 
-# mod and wf
-rf_mod <- rand_forest( mtry = tune(), min_n = tune(), trees = 500 ) %>%
-  set_engine("ranger", importance = "impurity") %>%
-  set_mode("regression")
+test_df <- test_joined %>%
+  rename(ds=Date)
 
-# Workflow
-rf_wf <- workflow() %>%
-  add_recipe(my_recipe) %>%
-  add_model(rf_mod) 
+## Fit prophet Model with extra regressors
+prophet_model <- prophet() %>%
+  add_regressor('Store') %>%
+  add_regressor('Dept') %>%
+  add_regressor('MarkDown_Total') %>%
+  fit.prophet(prophet_df)
 
-# Tuning grid
-tuning_grid <- grid_regular(
-  mtry(range = c(1, 10)),
-  min_n(range = c(2, 10)),
-  levels = 3
-)
+## Predict using Prophet Model
+prof_predict <- predict(prophet_model, test_df)
 
-# CV folds
-folds <- vfold_cv(train_joined, v = 3)
+store <- 17
+dept <- 17
 
-# Regression metrics
-metrics_reg <- metric_set(rmse, mae, rsq)
+## Filter and Rename to match prophet syntax
+sd_train <- train_joined %>%
+  filter(Store==store, Dept==dept) %>%
+  rename(y=Weekly_Sales, ds=Date)
 
-# Cross-validation
-CV_results <- rf_wf %>%
-  tune_grid(
-    resamples = folds,
-    grid = tuning_grid,
-    metrics = metrics_reg,
-    control = control_grid(save_pred = TRUE)
-  )
+sd_test <- test_joined %>%
+  filter(Store==store, Dept==dept) %>%
+  rename(ds=Date)
 
-## Find Best Tuning Parameters 
-bestTune <- CV_results %>% select_best(metric = "rmse")
 
-## Finalize the Workflow & fit it 
-final_wf <- rf_wf %>%
-  finalize_workflow(bestTune)%>%
-  fit(data=train_joined) 
+## Fit a prophet model
+prophet_model <- prophet() %>%
+  add_regressor('Store') %>%
+  add_regressor('Dept') %>%
+  add_regressor('MarkDown_Total') %>%
+  add_regressor('Store') %>%
+  add_regressor('IsHoliday.x') %>%
+  add_regressor('Temperature') %>%
+  add_regressor('CPI') %>%
+  add_regressor('Unemployment') %>%
+  add_regressor('IsHoliday.y') %>%
+  fit.prophet(df=sd_train)
+
+
+## Predict Using Fitted prophet Model
+fitted_vals <- predict(prophet_model, df=sd_train) #For Plotting Fitted Values
+test_preds <- predict(prophet_model, df=sd_test) #Predictions are called "yhat"
+
+## Plot Fitted and Forecast on Same Plot
+ggplot() +
+  geom_line(data = sd_train, mapping = aes(x = ds, y = y, color = "Data")) +
+  geom_line(data = fitted_vals, mapping = aes(x = as.Date(ds), y = yhat, color = "Fitted")) +
+  geom_line(data = test_preds, mapping = aes(x = as.Date(ds), y = yhat, color = "Forecast")) +
+  scale_color_manual(values = c("Data" = "black", "Fitted" = "blue", "Forecast" = "red")) +
+  labs(color="")
+
+
 
 ## Predict 
-final_predictions <- final_wf %>%
-  predict(new_data = test_joined) %>%
-  bind_cols(test_data %>% select(Store, Dept, Date)) %>%
-  rename(Weekly_Sales = .pred) %>%
-  mutate(Id = paste(Store,Dept,Date, sep = "_")) %>% 
+
+prof_predict <- prof_predict %>%
+  mutate(
+    Store = test_joined$Store,
+    Dept  = test_joined$Dept
+  )
+
+first_predictions <- prof_predict %>%
+  select(-Store, -Dept) %>%                      # REMOVE old Store/Dept
+  bind_cols(test_joined %>% select(Store, Dept, Date)) %>% 
+  rename(Weekly_Sales = yhat) %>%
+  mutate(Id = paste(Store, Dept, Date, sep = "_")) %>% 
+  select(Id, Weekly_Sales)
+
+  
+second_predictions <- test_preds %>% 
+  select(-Store, -Dept) %>%                      # REMOVE old Store/Dept
+  bind_cols(test_joined %>% select(Store, Dept, Date)) %>% 
+  rename(Weekly_Sales = yhat) %>%
+  mutate(Id = paste(Store, Dept, Date, sep = "_")) %>% 
   select(Id, Weekly_Sales)
 
 
-# Export processed dataset 
+vroom_write(x = first_predictions, file = "./walmart_fb_model_a.csv", delim = ",")
 
-vroom_write(x = final_predictions, file = "./walmart_rf_model_a.csv", delim = ",")
-
-best_rmse <- CV_results %>%
-  show_best(metric = "rmse", n = 1)
-best_rmse
